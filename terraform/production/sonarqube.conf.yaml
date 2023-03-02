@@ -1,0 +1,6 @@
+logs:
+  - type: file
+    path: "/var/opt/sworks/sonarqube-8.2.0.32929/logs/sonar.log"
+    service: "sonarqube"
+    source: "sonarqube"
+    

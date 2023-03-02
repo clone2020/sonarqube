@@ -1,0 +1,109 @@
+---
+
+- hosts: all
+  become: yes
+  check_mode: no
+  diff: yes
+  vars_files:
+    - "../tf_ansible_vars_file.yml"
+  tasks:
+
+    - name: List the blocks blockid and Registering Starting Taegis Agent...
+      command: "{{ item }}"
+      with_items:
+        - lsblk
+        - blkid /dev/nvme1n1
+        - /opt/sworks/taegis-agent/bin/taegisctl register --key 'qCVe6bGwFFGiwElf3z7R3wb' --server 'reg.c.taegiscloud.com'
+        - /opt/sworks/taegis-agent/bin/taegisctl start
+      register: command_output
+    - debug: msg="{{command_output.results | map (attribute='stdout_lines') | list}}"
+
+    - name: Mount the filesystem and put entry into fstab
+      mount:
+        path: /var/opt/sworks/sonarqube-{{ tf_sonar_version }}/data
+        src: /dev/nvme1n1
+        opts: defaults,nofail
+        fstype: xfs
+        state: mounted
+
+    - name: Copy sonarqube.conf.yaml
+      copy:
+        src: ../sonarqube.conf.yaml
+        dest: /etc/datadog-agent/conf.d/sonarqube.d/conf.yaml
+        owner: dd-agent
+        group: sonarqube
+
+    - name: version changes in sonarqube.conf.yaml
+      lineinfile:
+        path: /etc/datadog-agent/conf.d/sonarqube.d/conf.yaml
+        regexp: "^{{ item.property | regex_escape() }}:*"
+        line: "{{ item.property }}:{{ item.value }}"
+      with_items:
+              - { property: 'path', value: '"/var/opt/sworks/sonarqube-{{ tf_sonar_version }}/logs/sonar.log"' }
+
+    - name: Config changes to datadog.yaml
+      lineinfile:
+        path: /etc/datadog-agent/datadog.yaml
+        regexp: "^#? *{{ item.key | regex_escape() }}:"
+        line: "{{ item.key }}: {{ item.value }}"
+      with_dict:
+              'hostname_fqdn': 'true'
+              'collect_ec2_tags': 'true'
+              'logs_enabled': 'true'
+
+    - name: Block of config to datadog.yaml
+      blockinfile:
+        path: /etc/datadog-agent/datadog.yaml
+        block: |
+          hostname_force_config_as_canonical: true
+          process_config:
+             enabled: "true"
+          tags:
+            - env:{{ tf_env }}
+            - service: sonarqube-{{ tf_env }}
+            - version: {{ tf_sonar_version }}
+            - dc:aws-us-east-1
+            - vpc-name:voltron-core
+
+    - name: sysctl kernel parameters set vm.max_map_count
+      sysctl:
+         name: vm.max_map_count
+         value: 262144
+         state: present
+         sysctl_set: true
+         reload: true
+
+    - name: Insert process limits
+      lineinfile:
+        path: /etc/security/limits.conf
+        line: 'sonarqube    -    nofile    131072'
+        insertbefore: EOF
+
+    - name: Reload systemd
+      command: systemctl daemon-reload
+
+    - name: Change hostname to server
+      hostname:
+        name: sonarqube.aws-test.sworks.com
+
+    - name: Insert a line to preserve the hostname
+      lineinfile:
+        path: /etc/cloud/cloud.cfg
+        line: 'preserve_hostname: true'
+        insertbefore: BOF
+
+    - name: Reload config changes
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and Start Sonarqube service.
+      systemd:
+        name: sonarqube
+        enabled: yes
+        state: started
+
+    - name: Registering and Starting Taegis Agent...
+      command: {{ item }}
+      with_items:
+      - /opt/sworks/taegis-agent/bin/taegisctl register --key 'alkjalkjasdkfjlasjf' --server 'reg.c.taegiscloud.com'
+      - /opt/sworks/taegis-agent/bin/taegisctl start

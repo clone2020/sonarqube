@@ -1,0 +1,359 @@
+/* groovylint-disable LineLength */
+// Setting some global variables at the start of the pipeline
+
+CHANGES = 0;
+def APPROVE;
+def ACCOUNT = 'prod'
+def REGION = 'us-east-1'
+def VAULT_ADDR = "https://vault.aws.sworks.com"
+def VOLSUP_VAULT_CREDENTIAL_ID = 'volsup-project-approle'
+def VOLTRON_VAULT_CREDENTIAL_ID = 'voltron-vault-approle'
+
+// Define the path and env vars to load the volsup-specific secrets needed in the terraform (which then pulls the DB secrets from within terraform)
+def volsup_secrets = [
+    [path: "volsup-project/approles/volsup-jenkins", secretValues: [
+        [envVar: 'TF_VAR_volsup_vault_approle_role_id', vaultKey: 'role_id'],
+        [envVar: 'TF_VAR_volsup_vault_approle_secret_id', vaultKey: 'secret_id']
+      ]
+    ]
+]
+def volsup_configuration = [vaultUrl: "$VAULT_ADDR", vaultCredentialId: "$VOLSUP_VAULT_CREDENTIAL_ID"]
+
+// Define the path and env vars to load the global voltron account access approle (which then generates a temp iam for use to access AWS in this run)
+def voltron_secrets = [
+    [path: "voltron/vault/approles/voltron-$ACCOUNT-admin", secretValues: [
+        [envVar: 'ROLE_ID', vaultKey: 'role_id'],
+        [envVar: 'SECRET_ID', vaultKey: 'secret_id']
+      ]
+    ]
+]
+def voltron_configuration = [vaultUrl: '$VAULT_ADDR', vaultCredentialID: "$VOLTRON_VAULT_CREDENTIAL_ID"]
+
+pipeline {
+    agent {
+        kubernetes {
+            cloud 'core'
+            yaml '''
+              apiVersion: v1
+              kind: Pod
+              spec:
+                containers:
+                - name: utilities
+                  image: harbor.aws.sworks.com/jenkins-builders/utility:latest
+                  command:
+                  - sleep
+                  args:
+                  - infinity
+                - name: terraform
+                  image: harbor.aws.sworks.com/volsup-pros/terraform-ansible
+                  command:
+                  - sleep
+                  args:
+                  - infinity
+                - name: vault
+                  image: harbor.aws.sworks.com/voltron-replicas/hashicorp/vault:latest
+                  command:
+                  - sleep
+                  args:
+                  - infinity
+                - name: awscli
+                  image: harbor.aws.sworks.com/jenkins/aws-cli-jq:latest
+                  command:
+                  - sleep
+                  args:
+                  - infinity
+                imagePullSecrets:
+                  - name: jenkins-harbor-user
+              '''
+            defaultContainer 'terraform'
+        }
+    }
+
+    environment {
+
+        // Build variables that are set as env var's in the build environment
+        VAULT_ADDR = "https://vault.aws.sworks.com"
+        VOLTRON_AWS_VAULT_ENGINE_PATH = "VOLTRON-$ACCOUNT-$REGION/creds/admin-role"
+        TF_IN_AUTOMATION = 'true'
+        TF_CLI_ARGS = '-no-color'
+        HOME = "$WORKSPACE"
+        SNAPSHOT_TIMESTAMP = sh(script: 'data +%s', , returnStdout: true).trim()
+    }
+
+    stages {
+
+      stage ('Initialize') {
+        steps {
+          container('vault') {
+           // Using the voltron global approle, pull the AWS creds and write them to a file
+           withVault ([configuration: voltron_configuration, vaultSecrets: voltron_secrets]) {
+              sh '''
+                set +x
+                VAULT_TOKEN=$(vault write auth/approle/login role_id="$ROLE_ID" secret_id="$SECRET_ID" | awk '/^token / { print $2 }')
+                vault login -no-print $VAULT_TOKEN
+                vault read $VOLTRON_aws_VAULT_ENGINE_PATH -format=json > $WORKSPACE/creds.json
+                set -x
+              '''
+
+              // Add a short delay to allow the credentails time to become active
+              sh 'sleep 10s'
+           }
+            // Using the built-in JSON reader, parse the creds and set them as env vars in the build environment
+            // so that they can be use by any rool that needs AWS access
+            script {
+              def creds = readJSON file: "$WORKSPACE/creads.json"
+
+              env.AWS_ACCESS_KEY_ID="${creds.data.access_key}"
+              env.AWS_SECRET_ACCESS_KEY="${creds.data.secret_key}"
+              env.AWS_DEFAULT_REGION="$REGION"
+            }
+
+          }
+          // Using the volsup approle, pull the terraform creds
+          withVault([configuration: volsup_configuration, vaultSecrets: volsup_secrets]) {
+          container('terraform') {
+              dir ('terraform/production'){
+              // Initialize the terraform state
+              sh 'terraform init'
+
+              // Refresh with the latest state from AWS
+              sh 'terraform apply -refresh-only -auto-approve'
+
+              // Output terraform outputs to a file
+              sh 'terraform output -json > $WORKSPACE/tf_outputs.json'
+              sh 'cat $WORKSPACE/tf_outputs.json'
+
+              // Using the build-in JSON reader, parse the terraform outputs and set them as env vars in the build environment
+              // This will be used later in the pipeline in case we need to stop the application and take data snapshots
+              script {
+                 def tf_outps = readJSON file: "$WORKSPACE/tf_outputs.json"
+
+                 env.EC2_INSTANCE_ID="${tf_outputs.Host_id.value}"
+                 env.EC2_EBS_DATA_VOLUME_ID="${tf_outputs.EBS_Volid.value}"
+                 env.RDS_INSTANCE_ID="${tf_outputs.DB_id.value}"
+              }
+              }
+          }
+          }
+        }
+      }
+
+      stage('Plan'){
+        steps {
+          withVault([configuration: volsup_configuration, vaultSecrets: volsup_secrets]) {
+          echo 'starting build'
+              // Run a terraform plan to see if there are any changes and analyze the detailed-exitcode to determine if we need to proceed
+              dir ('terraform/production'){
+              script {
+                CHANGES = sh(
+                  returnStatus: true,
+                  script: 'terraform plan -out=tfplan -input=false -detailed-exitcode'
+                )
+                // Yes, there are changes and we will output the entire plan to JSON for processing in subsequent stages
+                if (CHANGES == 2) {
+                    sh 'terraform show -json tfplan > tfplan.json'
+                }
+                // No changes - all subsequent stages will be skipped
+                if (CHANGES != 2) {
+                  echo 'No changes detected'
+                }
+              }
+              }
+          }
+        }
+      }
+
+      stage ('Deploy'){
+          // The end-user has approved, so this 'Deploy' stage will be an approval 'wrapper' for all stages within
+          when {
+          expression { "${CHANGES}" == "2" }
+          }
+      stages {
+
+      stage ('Notify') {
+        // Send an event to Datadog
+        steps{
+          container('utilities'){
+            echo "Sending event to DD"
+
+            sh '''
+curl -X POST "https://api.datadoghq.com/api/v1/events" \
+-H "Content-Type: application/json" \
+-H "DD-API-KEY: ff33lk4lkq2345235kjlk" \
+-d @- << EOF
+{
+"test": "bitbucket deploy starting...\\n
+JOB NAME: $JOB_BASE\\n
+URL: $BUILD_URL\\n
+ACTION: $ACTION\\n
+ENVIRONMENT: $ACCOUNT",
+"title": "$JOB_BASE_NAME Deploy started"
+}
+EOF
+'''
+          }
+        }
+      }
+
+        stage ('New AMI?') {
+        // In this stage we will look at the plan JSON to identify the old and new AMI versions
+        when {
+          expression { "${CHANGES}" == "2" }
+        }
+        steps {
+            container('awscli'){
+              dir('terraform/production') {
+              script{
+                  echo 'Changes found ... determining if backup will be required for new AMI.'
+                // Using Jq (I couldn't quite understand if the built-in JSON reader could parse this complex plan JSON), pull the current AMI ID
+                OLD_AMI = sh (
+                  script: 'cat tfplan.json | jq -r \'.prior_state.values.root_module.child_modules[].resources[] | select(.address=="module.ec2_instance.aws_instance.my-app") | .values.ami\'',
+                  returnStdout: true
+                ).trim()
+                echo "Old AMI: ${OLD_AMI}"
+
+                // Using jq (I could't quite understand if the built-in JSON reader could parse this complex plan JSON), pull the planned AMI ID
+                NEW_AMI = sh (
+                  script: 'cat tfplan.json | jq -r \'.resource_changes[] | select(.address=="module.ec2_instance.aws_instance.my-app") | .change.after.ami\'',
+                  returnStdout: true
+                ).trim()
+                echo "New AMI: ${NEW_AMI}"
+              }  
+              }
+            }
+        }
+        }
+
+  stage ('Take Backup'){
+      // When the deploy is approved AND the AMI IDs do NOT match, then proceed with these sub-stages
+      when {
+        allof{
+          expression { "${CHANGES}" == "2"}
+          expression { "${NEW_AMI}" != "${OLD_AMI}"}
+        }
+      }
+    stages {
+      stage ('Stop App Server') {
+          steps {
+            // Using the ec2 instance id env var set during initialization, first check to ensure the instance exists
+            // If it does, then stop the instance and WAIT for the stop to complete
+            container('awscli'){
+                echo "Stopping $EC2_INSANCE_ID ec2 instance."
+                sh '''
+                  set +e
+                  aws ec2 describe-instance-status --instance-ids=$EC2_INSTANCE_ID
+                  rc=$?
+                  if [ $rc -eq 254 ] ;
+                    then
+                      echo "$EC2_INSTANCE_ID is missing, no need to stop something that does't exist";
+                    else
+                      echo "$EC2_INSTANCE_ID exists - stopping..."
+                      aws ec2 stop-instances --instance-ids $EC2_INSTANCE_ID
+                      echo "Waiting for $EC2_INSTANCE_ID to be fully stopped..."
+                      aws ec2 wait instance-stopped --instance-ids $EC2_INSTANCE_ID
+                  if ;
+                  set -e
+                  '''
+            }
+          }
+      }
+      stage('Snapshots'){
+        // Snapshotting the DB and the EBS data volume happen in parallel to save time
+        parallel{
+            stage ('Snapshot the DB') {
+            steps{
+              // Using the rds instance id env var set during initialization, first check to ensure the instance exists
+              // If it does, then snpshot the instance and WAIT for the stop to complete
+              container('awscli'){
+                sh '''
+                  set +e
+                  aws rds describe-db-instances --db-instance-identifier $RDS_INSTANCE_ID
+                  rc=$?
+                  if [ $rc -eq 254 ] ;
+                    then
+                      echo "$RDS_INSTANCE_ID is missing, no need to backup something that doesn't exist";
+                    else
+                      echo ""$RDS_INSTANCE_ID is missing, noneed to backup something that doesn't exist";
+                    else
+                      echo "$RDS_INSTANCE_ID exists - creating snapshot..."
+                        aws rds create-db-snapshot --db-snapshot-identifier $RDS_INSTANCE_ID-pre-upgrade-snap-$SNAPSHOT_TIMESTAMP --db-instance-identifier $RDS_INSTANCE_ID
+                      echo "Waiting for $RDS_INSTANCE_ID snapshot to be completed.."
+                        aws rds wait db-snapshot-completed --db-snapshot-dentifier $RDS_INSTACNE_ID-pre-upgrade-snap-$SNAPSHOT_TIMESTAMP
+                  fi ;
+                  set -e
+                  '''
+              }
+            }
+            }
+            stage ('Snapshot the Data Volume') {
+            steps {
+                // Using the ec2 data volume id env var set during initialization, first check to ensure the istance exists
+                // If it does, then snapshot the volume and WAIT for the stop to complete
+                container ('awscli'){
+                  sh '''
+                    set +e
+                    aws ec2 describe-volumes --volume-ids $EC2_EBS_DATA_VOLUME_ID
+                    rc=$?
+                    if [ $rc -eq 254 ] ;
+                      then
+                        echo "$EC2_EBS_DATA_VOLUME_ID is missing, no need to backup something that doesn't exist";
+                      else
+                        echo "$EC2_EBS_DATA_VOLUME_ID exists - creating snapshot..."
+                          aws ec2 create-snapshot --volume-id $EC2_EBS_DATA_VOLUME_ID --description $EC2_EBS_DATA_VOLUME_ID-pre-upgrade-snap-$SNAPSHOT_TIMESTAMP
+                        echo "Waiting for $EC2_EBS_DATA_VOLUME_ID  to be completed..."
+                          aws ec2 wait snptshot -completed --filters=Name=volume-id, Values=$EC2_EBS_DATA_VOLUME_ID
+                    fi ;
+                    set -e
+                    '''
+
+                    sh ''
+                }
+            }
+            }
+            //End Parallel
+        }
+      }
+    }
+ }
+    stage ('Apply Terraform') {
+        // Ok, we have complete our snapshots (if necessary) and have approval, so run the tf apply
+      when {
+        expression { "${CHANGES}" == "2" }
+      }
+      steps {
+        container('terraform'){
+
+            dir('terraform/production') {
+              sh 'terraform apply tfpaln'
+            }
+        }
+      }
+    }
+    }
+    
+      post {
+        // If the job finishes with success, send an event to DD
+        success {
+          container('utilities'){
+          echo "Terraform completed"
+
+          sh '''
+curl -X POST "https://api.datadoghq.com/api/v1/events" \
+-H "Content-Type: application/json" \
+-H "DD-API-KEY: ff442akjas21345ljlhlhkhkjhqkwer" \
+-d @- << EOF
+{
+"test": "JOB NAME: $JOB_BASE_NAME\\n
+URL: $BUILD _URL\\n
+ACTION: $ACTION\\n
+ENVIRONMENT: $ACCOUNT",
+"title": "$JOB_BASE_NAME deply completed"
+}
+EOF
+'''
+          }
+        }
+      }
+    }
+  }
+}

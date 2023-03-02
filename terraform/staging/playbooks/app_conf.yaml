@@ -1,0 +1,148 @@
+---
+
+- hosts: all
+  become: yes
+  check_mode: no
+  diff: yes
+  vars:
+    plugin_version: "4.1.5"
+  vars_files: ../tf_ansible_vars_file.yml
+  tasks:
+
+    - name: Install xxd by installing vim-common
+      yum:
+        name: vim-common
+        state: present
+        update_cache: yes
+
+    - name: Check mandatory variables imported from Terraform
+      assert:
+        that:
+          - tf_secret_key is defined
+          - tf_secret_key_file is defined
+          - tf_dbpassword is defined
+        fail_msg: "tf_* variable usually defined in '../terraform/staging/tf_ansible_vars_file.yml' is missing"
+
+    - name: Download and unzip/extract sonarqube-{{ tf_sonar_version }}.zip into /var/opt/sworks
+      unarchive:
+        src: https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-{{ tf_sonar_version }}.zip
+        dest: /var/opt/sworks
+        remote_src: yes
+        list_files: yes
+
+    - name: Ensure the user is sonarqube
+      lineinfile:
+        path: /var/opt/sworks/sonarqube-{{ tf_sonar_version }}/bin/linux-x86-64/sonar.sh
+        regexp: '^[#]*{{ item.search }}\s*='
+        insertbefore: '[#]*{{ item.search }}\s*='
+        line: '{{ item.search }}'
+      with_items:
+              - { search: 'RUN_AS_USER', replace: 'RUN_AS_USER=sonarqube' }
+
+    - name: Download plugin for sonarqube "sonar-findbugs-plugin-{{ plugin_version }}.jar"
+      get_url:
+        url: https://repo.maven.apache.org/maven2/com/github/spotbugs/sonar-findbugs-plugin/{{ plugin_version }}/sonar-findbugs-plugin-{{ plugin_version }}.jar
+        dest: /var/opt/sworks/sonarqube-{{ tf_sonar_version }}/extensions/plugins
+        group: sonarqube
+        owner: sonarqube
+
+    - name: Copy sonar.properties
+      copy:
+        src: ../sonar.properties
+        dest: /var/opt/sworks/sonarqube-{{ tf_sonar_version }}/conf/sonar.properties
+        owner: sonarqube
+        group: sonarqube
+
+    - name: Directory to store the secret key file
+      file:
+        path: /var/opt/sworks/sonarqube-{{ tf_sonar_version }}/.sonar
+        state: directory
+        group: sonarqube
+        owner: sonarqube
+
+######################################## Secure Block ##################################
+
+    - name: Secure the secrets/password.
+      block:
+        - name: Copy sonar-secret.txt
+          copy:
+            src: ../{{tf_secret_key_file}}
+            dest: /var/opt/sworks/sonarqube-{{ tf_sonar_version }}/.sonar/sonar-secret.txt
+            owner: sonarqube
+            group: sonarqube
+
+        - name: Run openssl command.
+          shell: echo {aes}"$(echo -n '{{tf_dbpassword}}' | openssl aes-128-ecb -a -e -K $(echo '{{tf_secret_key}}' | base64 -d | xxd -p))"
+          register: enc_pass
+
+        - name: Save the enc_pass to a '$db_pass' variable.
+          set_fact:
+            db_pass: "{{ enc_pass.stdout }}"
+
+        - name: Add db username and encrypted pssword to properties file.
+          lineinfile:
+            path: /var/opt/sworks/sonarqube-{{ tf_sonar_version }}/conf/sonar.properties
+            regexp: '^[# ]*{{ item.search }}\s*='
+            insertafter: '[#]*{{ item.search }}\s*='
+            line: '{{ item.replace }}'
+          with_items:
+            - { search: 'sonar.jdbc.username', replace: 'sonar.jdbc.username=sonarqube' }
+            - { search: 'sonar.jdbc.password', replace: 'sonar.jdbc.password={{ db_pass }}' }
+      rescue:
+        - name: Print the '$db_pass' variable
+          debug:
+            msg: "{{ db_pass }} is error"
+
+      ignore_errors: yes
+      no_log: yes
+      # dont't forget
+
+    - name: DB, data and temp path in sonar.properties
+      lineinfile:
+        dest: /var/opt/sworks/sonarqube-{{ tf_sonar_version }}/conf/sonar.properties
+        regexp: "^[#]*{{ item.property | regex_escape() }}=*"
+        line: "{{ item.property }}={{ item.value }}"
+      with_items:
+              - { property: 'sonar.path.data', value: '/var/opt/sworks/sonarqube-{{ tf_sonar_version }}/data' }
+              - { property: 'sonar.path.temp', value: '/var/opt/sworks/sonarqube-{{ tf_sonar_version }}/temp' }
+              - { property: 'sonar.jdbc.url', value: 'jdbc:postgresql://sonarqube-{{ tf_env }}-database.{{ tf_domain }}:5432/sonarqube_{{ tf_env }}_db' }
+
+    - name: Add sonar.secretKeyPath mappings to sonar.properties
+      blockinfile:
+        path: /var/opt/sworks/sonarqube-{{ tf_sonar_version }}/conf/sonar.properties
+        block: |
+          #secret key path
+          sonar.secretKeyPath=/var/opt/sworks/sonarqube-{{ tf_sonar_version }}/.sonar/sonar-secret.txt
+
+    - name: Copy sonarqube.service
+      copy:
+        src: ../sonarqube.service
+        dest: /var/opt/sworks/sonarqube.service
+        owner: sonarqube
+        group: sonarqube
+
+    - name: version changes in sonarqube.service
+      lineinfile:
+        dest: /var/opt/sworks/sonarqube.service
+        regexp: "^[#]*{{ item.property | regex_escape() }}=*"
+        line: "{{ item.property }}={{ item.value }}"
+      with_items: 
+              - { property: 'ExecStart', value: '/var/opt/sworks/sonarqube-{{ tf_sonar_version }}/bin/linux-x86-64/sonar.sh start' }
+              - { property: 'ExecStop', value: '/var/opt/sworks/sonarqube-{{ tf_sonar_version }}/bin/linux-x86-64/sonar.sh stop' }
+
+    - name: Create symbolic link for sonarqube.service
+      file:
+        src: /var/opt/sworks/sonarqube.service
+        dest: /etc/systemd/system/sonarqube.service
+        state: link
+
+    - name: Recursively change ownership of a directory
+      file:
+        path: /var/opt/sworks
+        state: directory
+        recurse: yes
+        owner: sonarqube
+        group: sonarqube
+
+    - name: Reload systemd
+      command: systemctl daemon-reload

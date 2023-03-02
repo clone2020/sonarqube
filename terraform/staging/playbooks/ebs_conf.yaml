@@ -1,0 +1,23 @@
+---
+
+- hosts: all
+  become: yes
+  check_mode: no
+  diff: yes
+  vars_files:
+    - "../tf_ansible_vars_file.yml"
+  tasks:
+
+    - name: Create xfs filesystem on /dev/nvme1n1
+      filesystem:
+        fstype: xfs
+        dev: /dev/nvme1n1
+
+    - name: Mount the filesystem and put entry into fstab
+      mount:
+        path: /var/opt/sworks/sonarqube-{{ tf_sonar_version }}/data
+        src: /dev/nvme1n1
+        opts: defaults,nofail
+        fstype: xfs
+        state: mounted
+

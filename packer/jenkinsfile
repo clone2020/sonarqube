@@ -1,0 +1,135 @@
+def VAULT_ADDR = "https://vault.aws.sworks.com"
+def VOLSUP_VAULT_CREDENTIAL_ID = 'support-project-approle'
+def VOLTRON_VAULT_CREDENTIAL_ID = 'team-vault-approle'
+
+// Define the path and env vars to load the volsup-specific secrets needed in the terraform (which then pulls the DB secrets form within terraform)
+def support_secrets = [
+    [path: "volsup-project/approles/volsup-jenkins", secretValues: [
+        [envVar: 'VOLSUP_APPROLE_ROLE_ID', vaultKey: 'role_id'],
+        [envVar: 'VOLSUP_APPROLE_SECRET_ID', vaultKey: 'secret_id']
+      ]
+    ]
+]
+
+def volsup_configuration = [vaultUrl: "$VAULT_ADDR", vaultCredentialId: "$VOLSUP_VAULT_CREDENTIAL_ID"]
+
+pipeline {
+    agent {
+        kubernetes {
+            cloud 'core'
+            yaml '''
+              apiVersion: v1
+              kind: Pod
+              spec:
+                containers:
+                - name: packer
+                  image: harbor.aws.sworks.com/voltron-replicas/hashicorp/packer:latest
+                  command:
+                  - sleep
+                  args:
+                  - infinity
+                - name: vault
+                  image: harbor.aws.sworks.com/voltron-replicas/hashicorp/vault:latest
+                  command:
+                  - sleep
+                  args:
+                  - infinity
+                imagePullSecrets:
+                  - name: jenkins-harbor-user
+            '''
+        }
+    }
+    parameters {
+        choice(
+            name: 'ACCOUNT',
+            choices: [
+                'test',
+                'prod'
+            ],
+            description: 'Which Voltron AWS account should the image be build for.'
+        )
+    }
+    environment {
+        ACCOUNT = "$params.ACCOUNT"
+        REGION = "us-east-1"
+
+        // https://www.vaultproject.io/docs/commands#vault_addr
+        VAULT_ADDR = "$VAULT_ADDR"
+
+        // Build variables
+        HOME = "$WORKSPACE"
+        JOB_PATH='packer'
+        AWS_DEFAULT_REGION="$REGION"
+    }
+    stages {
+        stage ('Initialize') {
+            environment {
+                VAULT_CREDENTIAL_PATH="voltron/vault/approles/voltron-$ACCOUNT-admin"
+                VAULT_ROLE = 'admin-role'
+                VAULT_ENGINE_PATH = "voltron-$ACCOUNT-$REGION/creds/$VAULT_ROLE"
+            }
+            steps {
+                container('vault') {
+                    sh '''
+                      echo "Prepaing to build image:"
+                      echo "ACCOUNT: $ACCOUNT"
+                      echo "REGION: $REGION"
+                    '''
+
+                    withVault([
+                        configuration: [
+                            vaultUrl: env.VAULT_ADDR,
+                            vaultCredentialId: env.VAULT_CREDENTIAL_ID,
+                        ],
+                        vaultSecrets: [[
+                            path: env.VAULT_CREDENTIAL_PATH, secretValues: [
+                                [envVar: 'VOLTRON_APPROLE_ROLE_ID', vaultKey: 'role_id'],
+                                [envVar: 'VOLTRON_APPROLE_SECRET_ID', vaultKey: 'secret_id']
+                            ]
+                        ]]
+                    ]) {
+                        sh '''
+                          set +x
+                          VAULT_TOKEN=$(vault write auth/approle/login role_id="$VOLTRON_APPROLE_ROLE_ID" secret_id="$VOLTRON_APPROLE_SECRET_ID" | awk '/^token / { print $2}')
+                          vault login -no-print $VAULT_TOKEN
+                          vault read $VAULT_ENGINE_PATH -format=json > $WORKSPACE/creds.json
+                          set -x
+                        '''
+
+                        // Add a short delay to allow the credentails time to become active
+                        sh 'sleep 10s'
+
+                    script {
+                        def creds = readJSON file: "$WORKSPACE/creds.json"
+
+                        env.AWS_ACCESS_KEY_ID="${creds.data.access_key}"
+                        env.AWS_SECRET_ACCESS_KEY="${creds.data.secret_key}"
+                        env.AWS_DEFAULT_REGION="$REGION"
+                    }
+                    }
+                }
+            }
+        }
+        stage ('Build') {
+            steps {
+                withCredentials([[$class: 'VaultTokenCredentialBinding', credentialsId: "$VOLSUP_VAULT_CREDENTIAL_ID", vaultAddr: "$VAULT_ADDR"]]) {
+                    container('packer') {
+                        echo 'starting build'
+
+                          sh '''
+                            env
+                            cd $JOB_PATH
+                            packer init .
+                            packer build -color=false -var env=$ACCOUNT -var aws_region=$REGION .
+                          '''
+                    }
+                }
+            }
+            post {
+                success {
+                    echo "Packer completed"
+                }
+            }
+        }
+    }
+}
